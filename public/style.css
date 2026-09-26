@@ -889,6 +889,13 @@ main {
 .cutting-detail dt { color: var(--muted); }
 .cutting-detail dd { margin: 0; }
 .cutting-detail .cutting-detail-key { font-weight: 700; color: var(--ok-dark); }
+.cut-plan-head { margin: 10px 0 2px; }
+.cut-plan-title {
+  margin: 0;
+  font-size: 13px;
+  color: var(--brand-dark);
+}
+.cut-plan-hint { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
 .cutting-reasons {
   margin: 4px 0 0;
   padding-left: 18px;

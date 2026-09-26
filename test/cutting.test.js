@@ -11,6 +11,7 @@ const {
   parseRequiredSheets,
   solveGuillotine,
   positionTree,
+  pruneForLastSheet,
   buildCuttingPlan,
 } = require('../lib/cutting');
 
@@ -395,6 +396,7 @@ const big16 = exactRun.options[0];
 assert.strictEqual(big16.sheetsRequired, 2);
 assert.strictEqual(big16.lastSheet.isLastSheetPartial, false);
 assert.strictEqual(big16.lastSheet.lastSheetYield, 0);
+assert.strictEqual(big16.lastSheetCutting, null, '整除时不应生成尾张裁切方案');
 assert.ok(Math.abs(big16.waste.totalAreaMm2 - 2 * big16.waste.perSheetAreaMm2) < 0.01);
 
 // 漏刀回归（API 同口径）：350×250 原纸裁 300×200 印张，报告可行且必须给出
@@ -451,6 +453,224 @@ assert.strictEqual(flushOpt.feasible, true);
 assert.strictEqual(flushOpt.cutting.cutCount, 0);
 assert.strictEqual(flushOpt.cutting.wasteRegions.length, 0);
 assert.strictEqual(flushOpt.waste.perSheetAreaMm2, 0);
+
+// ---------- 4b. 尾张剪枝：保留满排前余数个位、无成品子树合并为余料、无无关刀 ----------
+
+/**
+ * 校验一份已展平的裁切方案（满张或尾张）：印张不重叠/不越界、印张+废料铺满
+ * 原纸、cuts 按序可执行（每刀贯通当前料件）、tree 与 items/cuts/wasteRegions 同源。
+ */
+function validatePlacedCutting(frameW, frameH, c, label) {
+  assert.strictEqual(c.cutCount, c.cuts.length, `${label}: cutCount ≠ cuts.length`);
+
+  // 印张不越界、两两不重叠
+  for (const it of c.items) {
+    assert.ok(it.xMm >= -0.01 && it.yMm >= -0.01
+      && it.xMm + it.widthMm <= frameW + 0.01
+      && it.yMm + it.heightMm <= frameH + 0.01, `${label}: 印张越界`);
+  }
+  for (let i = 0; i < c.items.length; i += 1) {
+    for (let j = i + 1; j < c.items.length; j += 1) {
+      const p = c.items[i];
+      const q = c.items[j];
+      const overlap = p.xMm < q.xMm + q.widthMm - 1e-6
+        && q.xMm < p.xMm + p.widthMm - 1e-6
+        && p.yMm < q.yMm + q.heightMm - 1e-6
+        && q.yMm < p.yMm + p.heightMm - 1e-6;
+      assert.ok(!overlap, `${label}: 印张 ${i} 与 ${j} 重叠`);
+    }
+  }
+
+  // 印张 + 废料区域无缝铺满原纸（面积守恒）
+  const tiled = c.items.concat(c.wasteRegions)
+    .reduce((s, r) => s + r.widthMm * r.heightMm, 0);
+  assert.ok(Math.abs(tiled - frameW * frameH) < 0.1,
+    `${label}: 印张+废料 ${tiled} ≠ 原纸 ${frameW * frameH}`);
+
+  // cuts 按序可执行：从整张原纸开始，每刀替换当前料件为两条子料件
+  const keyOfRect = (r) => [r.x, r.y, r.w, r.h]
+    .map((v) => Math.round((v + Number.EPSILON) * 100) / 100).join('x');
+  const pieces = new Map([[keyOfRect({ x: 0, y: 0, w: frameW, h: frameH }), 1]]);
+  const consumePiece = (r) => {
+    const key = keyOfRect(r);
+    const n = pieces.get(key) || 0;
+    assert.ok(n > 0, `${label}: 刀序引用了不存在的料件 ${key}`);
+    if (n === 1) pieces.delete(key);
+    else pieces.set(key, n - 1);
+  };
+  const addPiece = (r) => pieces.set(keyOfRect(r), (pieces.get(keyOfRect(r)) || 0) + 1);
+  c.cuts.forEach((cut) => {
+    const piece = {
+      x: cut.pieceXMm, y: cut.pieceYMm, w: cut.pieceWidthMm, h: cut.pieceHeightMm,
+    };
+    consumePiece(piece);
+    if (cut.direction === 'v') {
+      assert.ok(Math.abs(cut.y1Mm - piece.y) < 0.01
+        && Math.abs(cut.y2Mm - (piece.y + piece.h)) < 0.01, `${label}: 竖切未贯通`);
+      const offset = cut.x1Mm - piece.x;
+      addPiece({ x: piece.x, y: piece.y, w: offset, h: piece.h });
+      addPiece({ x: cut.x1Mm, y: piece.y, w: piece.x + piece.w - cut.x1Mm, h: piece.h });
+    } else {
+      assert.ok(Math.abs(cut.x1Mm - piece.x) < 0.01
+        && Math.abs(cut.x2Mm - (piece.x + piece.w)) < 0.01, `${label}: 横切未贯通`);
+      addPiece({ x: piece.x, y: piece.y, w: piece.w, h: cut.y1Mm - piece.y });
+      addPiece({ x: piece.x, y: cut.y1Mm, w: piece.w, h: piece.y + piece.h - cut.y1Mm });
+    }
+  });
+  [
+    ...c.items.map((it) => ({ x: it.xMm, y: it.yMm, w: it.widthMm, h: it.heightMm })),
+    ...c.wasteRegions.map((r) => ({ x: r.xMm, y: r.yMm, w: r.widthMm, h: r.heightMm })),
+  ].forEach(consumePiece);
+  assert.strictEqual(pieces.size, 0, `${label}: 裁切后料件与印张/废料不一致`);
+
+  // tree 与展平数组同源
+  const leaves = [];
+  (function walk(node) {
+    if (node.kind === 'leaf') { leaves.push(node); return; }
+    walk(node.first); walk(node.second);
+  }(c.tree));
+  let treeCuts = 0;
+  (function walkCuts(node) {
+    if (node.kind !== 'cut') return;
+    treeCuts += 1; walkCuts(node.first); walkCuts(node.second);
+  }(c.tree));
+  assert.strictEqual(treeCuts, c.cutCount, `${label}: tree 刀节点数不一致`);
+  assert.strictEqual(leaves.filter((l) => l.used).length, c.items.length, `${label}: tree 成品叶不一致`);
+  assert.strictEqual(leaves.filter((l) => !l.used).length, c.wasteRegions.length, `${label}: tree 废料叶不一致`);
+}
+
+/**
+ * 无无关刀不变量：树中每个 cut 子树至少含 1 个成品叶（两侧都无成品的 cut 即
+ * 只切余料的无关刀，剪枝时必须已被合并）。入参为带绝对坐标的 positioned 树。
+ */
+function assertNoIrrelevantCuts(node, label) {
+  if (node.kind === 'leaf') return node.used ? 1 : 0;
+  const n1 = assertNoIrrelevantCuts(node.first, label);
+  const n2 = assertNoIrrelevantCuts(node.second, label);
+  assert.ok(n1 + n2 > 0, `${label}: 存在不含任何成品的 cut（无关刀）`);
+  return n1 + n2;
+}
+
+// 网格穷举：对每个可行规格与每个非零余数，剪枝树都必须几何有效、成品位为满排
+// 位号前缀、废料面积 = 原纸面积 − 余数成品面积、无无关刀、刀数不多于满排
+for (let W = 1; W <= 16; W += 1) {
+  for (let H = 1; H <= 16; H += 1) {
+    for (let a = 2; a <= 7; a += 1) {
+      for (let b = 2; b <= 7; b += 1) {
+        const full = solveGuillotine(W, H, a, b, new Map(), { states: 0 });
+        if (full.count === 0) continue;
+        const fullOut = { items: [], cuts: [], wasteRegions: [] };
+        positionTree(full.tree, 0, 0, fullOut);
+        for (let keep = 1; keep < full.count; keep += 1) {
+          const label = `尾张 W=${W},H=${H},a=${a},b=${b},keep=${keep}`;
+          const pruned = pruneForLastSheet(full.tree, keep);
+          const out = { items: [], cuts: [], wasteRegions: [] };
+          positionTree(pruned, 0, 0, out);
+          assert.strictEqual(out.items.length, keep, `${label}: 成品数`);
+          // 成品位严格等于满排位号顺序的前 keep 个
+          assert.deepStrictEqual(out.items, fullOut.items.slice(0, keep),
+            `${label}: 未按满排位置顺序保留成品位`);
+          // 废料面积守恒（废料叶求和 = 原纸面积 − 成品面积）
+          const waste = out.wasteRegions.reduce((s, r) => s + r.widthMm * r.heightMm, 0);
+          assert.ok(Math.abs(waste - (W * H - keep * a * b)) < 0.02,
+            `${label}: 尾张废料 ${waste} ≠ ${W * H - keep * a * b}`);
+          assert.ok(out.cuts.length <= fullOut.cuts.length, `${label}: 尾张刀数多于满排`);
+          const positioned = positionTree(pruned, 0, 0, { items: [], cuts: [], wasteRegions: [] });
+          assertNoIrrelevantCuts(positioned, label);
+        }
+      }
+    }
+  }
+}
+
+// 题述案例：100×100 mm 原纸裁 40×40 mm 印张、只需 1 个
+{
+  const tailPlan = buildCuttingPlan({
+    sheets: [{ sheet: 1 }],
+    sourceCount: 4, paddedCount: 0, totalCount: 4, blanks: 0,
+    panel: { width: 40 * PT_PER_MM, height: 40 * PT_PER_MM, orientation: 'square' },
+    sheet: { width: 40 * PT_PER_MM, height: 40 * PT_PER_MM },
+  }, [P('方纸', 100, 100)], 1);
+  const o = tailPlan.options[0];
+  assert.strictEqual(o.yieldsPerSheet, 4);
+  assert.strictEqual(o.sheetsRequired, 1);
+  assert.strictEqual(o.lastSheet.isLastSheetPartial, true);
+  assert.strictEqual(o.lastSheet.lastSheetYield, 1);
+  assert.strictEqual(o.lastSheet.spareCapacity, 3);
+  // 满张方案仍是满排：4 个位
+  assert.strictEqual(o.cutting.items.length, 4);
+  assert.strictEqual(o.cutting.cutCount, 7);
+  validatePlacedCutting(100, 100, o.cutting, '满张 100x100/40x40');
+  // 尾张方案：只保留满排第 1 个位（左上角），其余合并为余料，不得画出 4 个位
+  assert.ok(o.lastSheetCutting, '非整除时必须给出尾张方案');
+  const l = o.lastSheetCutting;
+  assert.strictEqual(l.yield, 1);
+  assert.strictEqual(l.items.length, 1);
+  assert.deepStrictEqual(l.items[0], { xMm: 0, yMm: 0, widthMm: 40, heightMm: 40, rotated: false });
+  assert.strictEqual(l.cutCount, 2, '尾张只需竖切 + 横切两刀取出左上角成品');
+  assert.strictEqual(l.wasteRegions.length, 2);
+  assert.ok(l.cutCount < o.cutting.cutCount, '尾张刀数必须少于满排（不含无关刀）');
+  validatePlacedCutting(100, 100, l, '尾张 100x100/40x40 keep1');
+  assertNoIrrelevantCuts(l.tree, '尾张 100x100/40x40 keep1');
+  // 尾张废料 = 原纸面积 − 1 个成品面积；总废料只计这 1 张尾张
+  assert.strictEqual(o.waste.lastSheetAreaMm2, 10000 - 1600);
+  assert.strictEqual(o.waste.totalAreaMm2, 10000 - 1600);
+  const tailWaste = l.wasteRegions.reduce((s, r) => s + r.widthMm * r.heightMm, 0);
+  assert.ok(Math.abs(tailWaste - 8400) < 0.01);
+  // 尾张首刀在整张原纸竖切 x=40，第二刀在 40×100 料件横切 y=40
+  assert.strictEqual(l.cuts[0].direction, 'v');
+  assert.strictEqual(l.cuts[0].x1Mm, 40);
+  assert.strictEqual(l.cuts[0].pieceWidthMm, 100);
+  assert.strictEqual(l.cuts[1].direction, 'h');
+  assert.strictEqual(l.cuts[1].y1Mm, 40);
+  assert.strictEqual(l.cuts[1].pieceWidthMm, 40);
+  assert.strictEqual(l.cuts[1].pieceHeightMm, 100);
+  JSON.parse(JSON.stringify(o));
+}
+
+// 整除：不产出尾张方案（lastSheetCutting 为 null），满张方案照常
+for (const exactNeed of [4, 8, 40]) {
+  const exactTail = buildCuttingPlan({
+    sheets: [{ sheet: 1 }],
+    sourceCount: 4, paddedCount: 0, totalCount: 4, blanks: 0,
+    panel: { width: 40 * PT_PER_MM, height: 40 * PT_PER_MM, orientation: 'square' },
+    sheet: { width: 40 * PT_PER_MM, height: 40 * PT_PER_MM },
+  }, [P('方纸', 100, 100)], exactNeed).options[0];
+  assert.strictEqual(exactTail.lastSheet.isLastSheetPartial, false, `need=${exactNeed}`);
+  assert.strictEqual(exactTail.lastSheetCutting, null, `need=${exactNeed}: 整除不应有尾张方案`);
+  assert.strictEqual(exactTail.cutting.items.length, 4);
+}
+
+// 大度对开 889×1194 裁 A4 印张、需 100（余 4）：尾张保留满排前 4 个位
+{
+  const bigTail = buildCuttingPlan(planA4, [P('大度对开', 889, 1194)], 100).options[0];
+  assert.strictEqual(bigTail.yieldsPerSheet, 8);
+  assert.strictEqual(bigTail.lastSheet.lastSheetYield, 4);
+  const f = bigTail.cutting;
+  const l = bigTail.lastSheetCutting;
+  assert.ok(l, '尾张方案必须存在');
+  assert.strictEqual(l.items.length, 4);
+  assert.deepStrictEqual(l.items, f.items.slice(0, 4), '尾张成品位为满排前 4 个');
+  validatePlacedCutting(889, 1194, f, '满张 大度对开');
+  validatePlacedCutting(889, 1194, l, '尾张 大度对开 keep4');
+  assertNoIrrelevantCuts(l.tree, '尾张 大度对开 keep4');
+  assert.ok(l.cutCount <= f.cutCount);
+  const expectedTailWaste = 889 * 1194 - 4 * 420 * 297;
+  assert.ok(Math.abs(bigTail.waste.lastSheetAreaMm2 - round2(expectedTailWaste)) < 0.5);
+  // 总废料 = 12 张满排 + 1 张尾张
+  const expectedTotal = 12 * bigTail.waste.perSheetAreaMm2 + bigTail.waste.lastSheetAreaMm2;
+  assert.ok(Math.abs(bigTail.waste.totalAreaMm2 - round2(expectedTotal)) < 0.5);
+}
+
+// 保留全部成品时剪枝不丢位（与满排成品坐标一致）
+{
+  const full = solveGuillotine(100, 100, 40, 40, new Map(), { states: 0 });
+  const fullOut = { items: [], cuts: [], wasteRegions: [] };
+  positionTree(full.tree, 0, 0, fullOut);
+  const allOut = { items: [], cuts: [], wasteRegions: [] };
+  positionTree(pruneForLastSheet(full.tree, 4), 0, 0, allOut);
+  assert.deepStrictEqual(allOut.items, fullOut.items);
+}
 
 // ---------- 5. 推荐排序：所需原纸张数 → 总废料面积 ----------
 

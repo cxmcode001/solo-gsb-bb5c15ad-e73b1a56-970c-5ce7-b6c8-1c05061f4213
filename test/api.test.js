@@ -653,6 +653,9 @@ function parseMultipart(body, contentType) {
     assert.strictEqual(cutA3.waste.perSheetAreaMm2, 0);
     assert.strictEqual(cutA3.cutting.items.length, 1);
     assert.strictEqual(cutA3.cutting.cuts.length, 0);
+    // 整除时无尾张方案
+    assert.strictEqual(cutA3.lastSheet.isLastSheetPartial, false);
+    assert.strictEqual(cutA3.lastSheetCutting, null);
 
     const cutBig = cutting.options[1];
     assert.strictEqual(cutBig.yieldsPerSheet, 8);
@@ -671,6 +674,38 @@ function parseMultipart(body, contentType) {
       assert.ok(Math.abs(it.widthMm - dims[0]) < 0.01 && Math.abs(it.heightMm - dims[1]) < 0.01);
     }
     assert.ok(Array.isArray(cutBig.cutting.wasteRegions));
+
+    // 尾张方案：只保留满排位号前 4 个成品位，items/wasteRegions 铺满原纸，
+    // 刀数不多于满排；尾张废料 = 原纸面积 − 4 个成品面积
+    assert.ok(cutBig.lastSheetCutting, '非整除必须返回 lastSheetCutting');
+    const cutTail = cutBig.lastSheetCutting;
+    assert.strictEqual(cutTail.items.length, 4);
+    assert.strictEqual(cutTail.yield, 4);
+    assert.strictEqual(cutTail.spareCapacity, 4);
+    assert.deepStrictEqual(
+      cutTail.items.map((it) => [it.xMm, it.yMm]),
+      cutBig.cutting.items.slice(0, 4).map((it) => [it.xMm, it.yMm]),
+      '尾张成品位必须是满排位置顺序的前 4 个',
+    );
+    assert.ok(cutTail.cutCount >= 1 && cutTail.cutCount <= cutBig.cutting.cutCount);
+    assert.strictEqual(cutTail.cuts.length, cutTail.cutCount);
+    const tailTiled = cutTail.items.concat(cutTail.wasteRegions)
+      .reduce((s, r) => s + r.widthMm * r.heightMm, 0);
+    assert.ok(Math.abs(tailTiled - 889 * 1194) < 1, '尾张印张与余料应铺满原纸');
+    const tailWaste = cutTail.wasteRegions
+      .reduce((s, r) => s + r.widthMm * r.heightMm, 0);
+    assert.ok(Math.abs(tailWaste - cutBig.waste.lastSheetAreaMm2) < 1);
+    assert.ok(Math.abs(cutBig.waste.lastSheetAreaMm2 - (889 * 1194 - 4 * 420 * 297)) < 1);
+    // 尾张每一刀都贯通其所在料件
+    for (const c of cutTail.cuts) {
+      if (c.direction === 'v') {
+        assert.ok(Math.abs(c.y1Mm - c.pieceYMm) < 0.01
+          && Math.abs(c.y2Mm - (c.pieceYMm + c.pieceHeightMm)) < 0.01);
+      } else {
+        assert.ok(Math.abs(c.x1Mm - c.pieceXMm) < 0.01
+          && Math.abs(c.x2Mm - (c.pieceXMm + c.pieceWidthMm)) < 0.01);
+      }
+    }
 
     // 漏刀回归（HTTP）：350×250 原纸裁 300×200 印张必须给出贯通刀线分离边料，
     // 边料在 wasteRegions 中；items + wasteRegions 铺满原纸
@@ -712,6 +747,7 @@ function parseMultipart(body, contentType) {
     assert.strictEqual(flush.cutting.cutCount, 0);
     assert.strictEqual(flush.cutting.wasteRegions.length, 0);
     assert.strictEqual(flush.waste.perSheetAreaMm2, 0);
+    assert.strictEqual(flush.lastSheetCutting, null);
 
     // 全部原纸都放不下：HTTP 200 + feasible=false + 明确原因
     const cutNoFitResp = await jsonRequest(server, '/api/cutting', {
