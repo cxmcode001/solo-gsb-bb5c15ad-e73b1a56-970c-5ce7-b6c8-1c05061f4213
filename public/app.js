@@ -1891,12 +1891,15 @@ function renderCuttingOption(opt, rank) {
     : `${opt.sheetsRequired} 张均出满 ${opt.yieldsPerSheet} 个，无尾张余量`;
   const items = [
     ['摆放方向', `${placementText}，版面 ${opt.placement.frameWidthMm} × ${opt.placement.frameHeightMm} mm${rotationLine}`],
-    ['单张产出', `${opt.yieldsPerSheet} 个印张（共 ${opt.cutting.cutCount} 刀贯通裁切）`],
+    ['单张产出', `${opt.yieldsPerSheet} 个印张（满张共 ${opt.cutting.cutCount} 刀贯通裁切）`],
     ['所需原纸张数', `${opt.sheetsRequired} 张`],
     ['尾张余量', lastText],
     ['单张废料', `${fmtArea(opt.waste.perSheetAreaMm2)}（印张利用率 ${opt.utilizationPercent}%）`],
-    ['总废料面积', fmtArea(opt.waste.totalAreaMm2)],
   ];
+  if (opt.lastSheet.isLastSheetPartial) {
+    items.push(['尾张废料', `${fmtArea(opt.waste.lastSheetAreaMm2)}（尾张裁切图灰色余料块合计）`]);
+  }
+  items.push(['总废料面积', fmtArea(opt.waste.totalAreaMm2)]);
   for (const [label, value] of items) {
     const dt = document.createElement('dt');
     dt.textContent = label;
@@ -1907,21 +1910,54 @@ function renderCuttingOption(opt, rank) {
   }
   card.appendChild(grid);
 
-  card.appendChild(buildCuttingDiagram(opt));
-  card.appendChild(buildCutOrder(opt));
+  if (opt.lastSheet.isLastSheetPartial && opt.lastSheet.cutting) {
+    // 不整除：分别呈现满张与尾张两套裁切图、下刀顺序
+    const fullTitle = opt.lastSheet.fullSheets > 0
+      ? `满张裁切方案（前 ${opt.lastSheet.fullSheets} 张，每张出 ${opt.yieldsPerSheet} 个）`
+      : `满排裁切方案（排满时每张出 ${opt.yieldsPerSheet} 个，本次仅尾张）`;
+    card.appendChild(buildSheetCuttingSection(
+      fullTitle, opt.cutting, `${opt.name} 满张裁切图`, '满张裁切顺序',
+    ));
+    card.appendChild(buildSheetCuttingSection(
+      `尾张裁切方案（第 ${opt.sheetsRequired} 张，只出 ${opt.lastSheet.lastSheetYield} 个）`,
+      opt.lastSheet.cutting, `${opt.name} 尾张裁切图`, '尾张裁切顺序',
+    ));
+  } else {
+    // 整除：只有满张方案
+    card.appendChild(buildCuttingDiagram(opt.cutting, `${opt.name} 裁切图`));
+    card.appendChild(buildCutOrder(opt.cutting, '裁切顺序'));
+  }
   return card;
+}
+
+/**
+ * 满张/尾张裁切方案分区：标题 + 裁切图 + 下刀顺序。
+ */
+function buildSheetCuttingSection(titleText, cutting, diagramLabel, orderTitle) {
+  const section = document.createElement('div');
+  section.className = 'sheet-cutting-plan';
+  const title = document.createElement('div');
+  title.className = 'sheet-cutting-plan-title';
+  title.textContent = titleText;
+  section.appendChild(title);
+  section.appendChild(buildCuttingDiagram(cutting, diagramLabel));
+  section.appendChild(buildCutOrder(cutting, orderTitle));
+  return section;
 }
 
 /**
  * 按原纸真实比例绘制 SVG 裁切图：原纸边框、贯通裁切线、印张（旋转印张用
  * 浅色区分）、尺寸标注。坐标取自服务端裁切树展平后的绝对 mm 坐标。
+ * @param {object} cutting 裁切方案（frame/item/items/cuts/wasteRegions，
+ *                         满张取 opt.cutting，尾张取 opt.lastSheet.cutting）
+ * @param {string} label 方案名称（用于无障碍标注）
  */
-function buildCuttingDiagram(opt) {
+function buildCuttingDiagram(cutting, label) {
   const wrap = document.createElement('div');
   wrap.className = 'cutting-diagram-wrap';
 
-  const frameW = opt.placement.frameWidthMm;
-  const frameH = opt.placement.frameHeightMm;
+  const frameW = cutting.frame.widthMm;
+  const frameH = cutting.frame.heightMm;
   // 图宽固定 320px，等比缩放
   const pxPerMm = 320 / frameW;
   const widthPx = frameW * pxPerMm;
@@ -1935,7 +1971,7 @@ function buildCuttingDiagram(opt) {
   svg.setAttribute('height', heightPx.toFixed(1));
   svg.setAttribute('role', 'img');
   svg.setAttribute('aria-label',
-    `${opt.name} 裁切图：${frameW} × ${frameH} mm 原纸，每张裁出 ${opt.yieldsPerSheet} 个印张`);
+    `${label}：${frameW} × ${frameH} mm 原纸，裁出 ${cutting.items.length} 个印张`);
 
   // 原纸底色与边框
   const bg = document.createElementNS(svgNS, 'rect');
@@ -1944,8 +1980,8 @@ function buildCuttingDiagram(opt) {
   bg.setAttribute('class', 'cut-paper-bg');
   svg.appendChild(bg);
 
-  // 废料区域（边料）：裁切后与印张分离的余料，斜纹灰色块表示
-  const wasteRegions = opt.cutting.wasteRegions || [];
+  // 废料/余料区域：裁切后与印张分离的边料与未裁出的成品位，斜纹灰色块表示
+  const wasteRegions = cutting.wasteRegions || [];
   wasteRegions.forEach((region) => {
     const rect = document.createElementNS(svgNS, 'rect');
     rect.setAttribute('x', (region.xMm * pxPerMm).toFixed(2));
@@ -1957,7 +1993,7 @@ function buildCuttingDiagram(opt) {
   });
 
   // 印张位
-  opt.cutting.items.forEach((item, i) => {
+  cutting.items.forEach((item, i) => {
     const rect = document.createElementNS(svgNS, 'rect');
     rect.setAttribute('x', (item.xMm * pxPerMm).toFixed(2));
     rect.setAttribute('y', (item.yMm * pxPerMm).toFixed(2));
@@ -1968,19 +2004,19 @@ function buildCuttingDiagram(opt) {
 
     // 位编号（过小则不标文字，避免重叠成糊块）
     if (item.widthMm * pxPerMm >= 26 && item.heightMm * pxPerMm >= 16) {
-      const label = document.createElementNS(svgNS, 'text');
-      label.setAttribute('x', ((item.xMm + item.widthMm / 2) * pxPerMm).toFixed(2));
-      label.setAttribute('y', ((item.yMm + item.heightMm / 2) * pxPerMm).toFixed(2));
-      label.setAttribute('class', 'cut-item-label');
-      label.setAttribute('text-anchor', 'middle');
-      label.setAttribute('dominant-baseline', 'central');
-      label.textContent = String(i + 1);
-      svg.appendChild(label);
+      const text = document.createElementNS(svgNS, 'text');
+      text.setAttribute('x', ((item.xMm + item.widthMm / 2) * pxPerMm).toFixed(2));
+      text.setAttribute('y', ((item.yMm + item.heightMm / 2) * pxPerMm).toFixed(2));
+      text.setAttribute('class', 'cut-item-label');
+      text.setAttribute('text-anchor', 'middle');
+      text.setAttribute('dominant-baseline', 'central');
+      text.textContent = String(i + 1);
+      svg.appendChild(text);
     }
   });
 
   // 贯通裁切线（执行顺序编号已在下方列表给出）
-  opt.cutting.cuts.forEach((cut) => {
+  cutting.cuts.forEach((cut) => {
     const line = document.createElementNS(svgNS, 'line');
     line.setAttribute('x1', (cut.x1Mm * pxPerMm).toFixed(2));
     line.setAttribute('y1', (cut.y1Mm * pxPerMm).toFixed(2));
@@ -2002,25 +2038,27 @@ function buildCuttingDiagram(opt) {
   caption.className = 'cutting-diagram-caption';
   const wasteCount = wasteRegions.length;
   const wasteText = wasteCount > 0
-    ? `，灰色虚线块为裁切后分离的边料（废料，共 ${wasteCount} 块）`
+    ? `，灰色虚线块为裁切后分离的余料（废料，共 ${wasteCount} 块）`
     : '，无废料边料';
   caption.textContent = `裁切图（按比例）：${frameW} × ${frameH} mm，`
-    + `红虚线为贯通裁切线，深色块为印张（${opt.cutting.item.widthMm} × `
-    + `${opt.cutting.item.heightMm} mm），浅色块为旋转 90° 的印张${wasteText}。`;
+    + `红虚线为贯通裁切线，深色块为印张（${cutting.item.widthMm} × `
+    + `${cutting.item.heightMm} mm），浅色块为旋转 90° 的印张${wasteText}。`;
   wrap.appendChild(caption);
   return wrap;
 }
 
 /**
  * 现场裁切顺序列表：cuts 已由服务端按先序（先切当前矩形再切子矩形）给出。
+ * @param {object} cutting 裁切方案（满张或尾张）
+ * @param {string} title 折叠区标题（如「裁切顺序」「尾张裁切顺序」）
  */
-function buildCutOrder(opt) {
+function buildCutOrder(cutting, title) {
   const details = document.createElement('details');
   details.className = 'cut-order-box';
   const summary = document.createElement('summary');
-  summary.textContent = `裁切顺序（${opt.cutting.cutCount} 刀，按此顺序每刀均为贯通直线）`;
+  summary.textContent = `${title}（${cutting.cutCount} 刀，按此顺序每刀均为贯通直线）`;
   details.appendChild(summary);
-  if (opt.cutting.cutCount === 0) {
+  if (cutting.cutCount === 0) {
     const p = document.createElement('p');
     p.className = 'cut-order-empty';
     p.textContent = '原纸尺寸与印张一致，无需裁切。';
@@ -2029,7 +2067,7 @@ function buildCutOrder(opt) {
   }
   const ol = document.createElement('ol');
   ol.className = 'cut-order-list';
-  opt.cutting.cuts.forEach((cut, i) => {
+  cutting.cuts.forEach((cut, i) => {
     const li = document.createElement('li');
     let pos;
     if (cut.direction === 'v') {

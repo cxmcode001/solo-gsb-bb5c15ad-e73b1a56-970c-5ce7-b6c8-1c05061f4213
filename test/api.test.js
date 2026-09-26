@@ -672,6 +672,24 @@ function parseMultipart(body, contentType) {
     }
     assert.ok(Array.isArray(cutBig.cutting.wasteRegions));
 
+    // 尾张方案（100 = 12×8 + 4，不整除）：尾张裁切树只保留满排前 4 个成品位，
+    // 无成品子树合并为余料；整除的 A3 只有满张方案
+    assert.strictEqual(cutBig.lastSheet.isLastSheetPartial, true);
+    const lastCut = cutBig.lastSheet.cutting;
+    assert.strictEqual(lastCut.items.length, 4);
+    assert.deepStrictEqual(lastCut.items, cutBig.cutting.items.slice(0, 4));
+    assert.ok(lastCut.cutCount <= cutBig.cutting.cuts.length);
+    assert.ok(lastCut.wasteRegions.length >= 1);
+    const lastTiled = lastCut.items.concat(lastCut.wasteRegions)
+      .reduce((s, r) => s + r.widthMm * r.heightMm, 0);
+    assert.ok(Math.abs(lastTiled - 889 * 1194) < 1, '尾张印张与余料应铺满原纸');
+    assert.strictEqual(cutBig.waste.lastSheetAreaMm2, lastCut.wasteAreaMm2);
+    // 尾张每刀贯通其所在料件（首刀贯通整张原纸）
+    assert.strictEqual(lastCut.cuts[0].pieceWidthMm, 889);
+    assert.strictEqual(lastCut.cuts[0].pieceHeightMm, 1194);
+    assert.strictEqual(cutA3.lastSheet.isLastSheetPartial, false);
+    assert.strictEqual(cutA3.lastSheet.cutting, null);
+
     // 漏刀回归（HTTP）：350×250 原纸裁 300×200 印张必须给出贯通刀线分离边料，
     // 边料在 wasteRegions 中；items + wasteRegions 铺满原纸
     const trimPlan = {
